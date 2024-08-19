@@ -191,8 +191,8 @@ def log_validation(
 
     # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    # autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
-    autocast_ctx = nullcontext()
+    autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
+    # autocast_ctx = nullcontext()
 
     with open('{}.txt'.format(args.instance_data_dir), "r") as f:
         prompts = f.read().splitlines()
@@ -1222,7 +1222,7 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    vae.to(accelerator.device, dtype=torch.float32)
+    vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
@@ -1581,11 +1581,11 @@ def main(args):
         )
     pipeline = StableDiffusion3Pipeline.from_pretrained(
         args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=accelerator.unwrap_model(text_encoder_one),
-        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-        text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-        transformer=accelerator.unwrap_model(transformer),
+        # vae=vae,  # TODO: 어떤 module이 memory를 일반적인 inference 때보다 과도하게 차지하는지 점검
+        # text_encoder=accelerator.unwrap_model(text_encoder_one),
+        # text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+        # text_encoder_3=accelerator.unwrap_model(text_encoder_three),
+        # transformer=accelerator.unwrap_model(transformer),
         revision=args.revision,
         variant=args.variant,
         torch_dtype=weight_dtype,
