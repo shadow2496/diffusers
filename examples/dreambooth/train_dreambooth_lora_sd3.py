@@ -42,6 +42,7 @@ from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms.functional import crop
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 
@@ -178,7 +179,7 @@ def log_validation(
     args,
     accelerator,
     pipeline_args,
-    epoch,
+    step,
     is_final_validation=False,
 ):
     logger.info(
@@ -193,26 +194,57 @@ def log_validation(
     # autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
     autocast_ctx = nullcontext()
 
-    with autocast_ctx:
-        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+    with open('{}.txt'.format(args.instance_data_dir), "r") as f:
+        prompts = f.read().splitlines()
+    idx = 0
+    for prompt in prompts:
+        prompt = prompt.lower().replace('<new1>', 'sks')
+        with autocast_ctx:
+            images = [pipeline(**pipeline_args, prompt=prompt, generator=generator).images[0] for _ in range(args.num_validation_images)]
 
-    for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
-        if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
-                    ]
-                }
-            )
+        save_dir = os.path.join(args.output_dir, 'outputs', '{}_{}'.format('{:02d}'.format(idx), prompt.replace(' ', '-')))
+        os.makedirs(save_dir, exist_ok=True)
+        for j, image in enumerate(images):
+            image.save(os.path.join(save_dir, '{:04d}_image{}_{}_.png'.format(step, j, prompt)))
+
+        images_tensor = [transforms.ToTensor()(image) for image in images]
+        grid = torch.stack(images_tensor, 0)
+        grid = make_grid(grid, nrow=args.num_validation_images)
+        transforms.ToPILImage()(grid).save(os.path.join(save_dir, '{:04d}_all.jpg'.format(step)))
+        idx += 1
 
     del pipeline
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    def save_new_images(outputs_dir, dirnames, filenames, new_dirname, idx_list):
+        os.makedirs(os.path.join(outputs_dir, new_dirname), exist_ok=True)
+        for filename in filenames:
+            if 'all.jpg' not in filename or os.path.exists(os.path.join(outputs_dir, new_dirname, filename)):
+                continue
+
+            new_img = Image.new('RGB', (514 * args.num_validation_images + 2, 516 * len(idx_list)))
+            for i, idx in enumerate(idx_list):
+                try:
+                    img = Image.open(os.path.join(outputs_dir, dirnames[idx], filename))
+                except:
+                    return
+                new_img.paste(img, (0, 516 * i))
+                if '0000' in filename:
+                    print('{} is opened'.format(os.path.join(outputs_dir, dirnames[idx], filename)))
+
+            new_img.save(os.path.join(outputs_dir, new_dirname, filename))
+            print('{} is saved'.format(os.path.join(outputs_dir, new_dirname, filename)))
+        print()
+    outputs_dir = os.path.join(args.output_dir, 'outputs')
+    dirnames_temp = sorted(os.listdir(outputs_dir))
+    dirnames = []
+    for dirname in dirnames_temp:
+        if '_clipseg' not in dirname:
+            dirnames.append(dirname)
+    # dirnames = sorted(os.listdir(outputs_dir))
+    filenames = sorted(os.listdir(os.path.join(outputs_dir, dirnames[0])))
+    save_new_images(outputs_dir, dirnames, filenames, 'all_00-{:02d}'.format(idx - 1), range(idx))
 
     return images
 
@@ -331,6 +363,7 @@ def parse_args(input_args=None):
         default=77,
         help="Maximum sequence length to use with with the T5 text encoder",
     )
+    parser.add_argument('--val_latents_checkpoint', type=str, default='./outputs/val_latents_s0023.pt')
     parser.add_argument(
         "--validation_prompt",
         type=str,
@@ -344,7 +377,7 @@ def parse_args(input_args=None):
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
-        "--validation_epochs",
+        "--validation_steps",
         type=int,
         default=50,
         help=(
@@ -1062,7 +1095,8 @@ def main(args):
 
     # If passed along, set the training seed now.
     if args.seed is not None:
-        set_seed(args.seed)
+        set_seed(args.seed, device_specific=True)
+        torch.backends.cudnn.deterministic = True
 
     # Generate class images if prior preservation is enabled.
     if args.with_prior_preservation:
@@ -1104,7 +1138,7 @@ def main(args):
 
                 for i, image in enumerate(images):
                     hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images:03d}-{hash_image}.jpg"
                     image.save(image_filename)
 
             del pipeline
@@ -1537,6 +1571,42 @@ def main(args):
         tracker_name = "dreambooth-sd3-lora"
         accelerator.init_trackers(tracker_name, config=vars(args))
 
+    val_latents = torch.load(args.val_latents_checkpoint).to(dtype=weight_dtype)  # TODO: val_latents 사용하도록 수정
+    # val_latents = torch.randn(8, 4, 64, 64, dtype=torch.float16)
+
+    # create pipeline
+    if not args.train_text_encoder:
+        text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
+            text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
+        )
+    pipeline = StableDiffusion3Pipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=accelerator.unwrap_model(text_encoder_one),
+        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+        text_encoder_3=accelerator.unwrap_model(text_encoder_three),
+        transformer=accelerator.unwrap_model(transformer),
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline_args = {
+        # "prompt": args.validation_prompt,
+        "num_inference_steps": 28,  # TODO: 왜 default값이 28인지 확인
+        "guidance_scale": 7.0,  # TODO: 왜 default값이 7.0인지 확인
+    }
+    images = log_validation(
+        pipeline=pipeline,
+        args=args,
+        accelerator=accelerator,
+        pipeline_args=pipeline_args,
+        step=0,
+    )
+    if not args.train_text_encoder:
+        del text_encoder_one, text_encoder_two, text_encoder_three
+        torch.cuda.empty_cache()
+        gc.collect()
+
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1581,6 +1651,7 @@ def main(args):
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
+        position=1,
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
@@ -1737,6 +1808,40 @@ def main(args):
                 global_step += 1
 
                 if accelerator.is_main_process:
+                    if global_step % args.validation_steps == 0:
+                        # create pipeline
+                        if not args.train_text_encoder:
+                            text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
+                                text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
+                            )
+                        pipeline = StableDiffusion3Pipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            vae=vae,
+                            text_encoder=accelerator.unwrap_model(text_encoder_one),
+                            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+                            text_encoder_3=accelerator.unwrap_model(text_encoder_three),
+                            transformer=accelerator.unwrap_model(transformer),
+                            revision=args.revision,
+                            variant=args.variant,
+                            torch_dtype=weight_dtype,
+                        )
+                        pipeline_args = {
+                            # "prompt": args.validation_prompt,
+                            "num_inference_steps": 28,  # TODO: 왜 default값이 28인지 확인
+                            "guidance_scale": 7.0,  # TODO: 왜 default값이 7.0인지 확인
+                        }
+                        images = log_validation(
+                            pipeline=pipeline,
+                            args=args,
+                            accelerator=accelerator,
+                            pipeline_args=pipeline_args,
+                            step=global_step,
+                        )
+                        if not args.train_text_encoder:
+                            del text_encoder_one, text_encoder_two, text_encoder_three
+                            torch.cuda.empty_cache()
+                            gc.collect()
+
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
@@ -1768,38 +1873,6 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
-
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                if not args.train_text_encoder:
-                    # create pipeline
-                    text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
-                        text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
-                    )
-                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                    transformer=accelerator.unwrap_model(transformer),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline_args = {"prompt": args.validation_prompt}
-                images = log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=pipeline_args,
-                    epoch=epoch,
-                )
-                if not args.train_text_encoder:
-                    del text_encoder_one, text_encoder_two, text_encoder_three
-
-                torch.cuda.empty_cache()
-                gc.collect()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -1837,14 +1910,18 @@ def main(args):
 
         # run inference
         images = []
-        if args.validation_prompt and args.num_validation_images > 0:
-            pipeline_args = {"prompt": args.validation_prompt}
+        if args.num_validation_images > 0:
+            pipeline_args = {
+                # "prompt": args.validation_prompt,
+                "num_inference_steps": 28,  # TODO: 왜 default값이 28인지 확인
+                "guidance_scale": 7.0,  # TODO: 왜 default값이 7.0인지 확인
+            }
             images = log_validation(
                 pipeline=pipeline,
                 args=args,
                 accelerator=accelerator,
                 pipeline_args=pipeline_args,
-                epoch=epoch,
+                step=global_step,
                 is_final_validation=True,
             )
 
