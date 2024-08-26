@@ -198,14 +198,16 @@ def log_validation(
         prompts = f.read().splitlines()
     idx = 0
     for prompt in prompts:
-        prompt = prompt.lower().replace('<new1>', 'sks')
+        prompt = prompt.lower()
+        text = prompt.replace('<new1> ', '').replace(' <new1>', '')
+        prompt = prompt.replace('<new1>', 'sks')
         with autocast_ctx:
             images = [pipeline(**pipeline_args, prompt=prompt, generator=generator).images[0] for _ in range(args.num_validation_images)]
 
         save_dir = os.path.join(args.output_dir, 'outputs', '{}_{}'.format('{:02d}'.format(idx), prompt.replace(' ', '-')))
         os.makedirs(save_dir, exist_ok=True)
         for j, image in enumerate(images):
-            image.save(os.path.join(save_dir, '{:04d}_image{}_{}_.png'.format(step, j, prompt)))
+            image.save(os.path.join(save_dir, '{:04d}_image{}_{}_.png'.format(step, j, text)))
 
         images_tensor = [transforms.ToTensor()(image) for image in images]
         grid = torch.stack(images_tensor, 0)
@@ -1572,7 +1574,7 @@ def main(args):
         accelerator.init_trackers(tracker_name, config=vars(args))
 
     val_latents = torch.load(args.val_latents_checkpoint).to(dtype=weight_dtype)  # TODO: val_latents 사용하도록 수정
-    # val_latents = torch.randn(8, 4, 64, 64, dtype=torch.float16)
+    # val_latents = torch.randn(8, 16, 128, 128, dtype=torch.float16)
 
     # create pipeline
     if not args.train_text_encoder:
@@ -1863,7 +1865,7 @@ def main(args):
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step:04d}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
