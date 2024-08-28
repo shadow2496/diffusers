@@ -204,6 +204,12 @@ def import_model_class_from_model_name_or_path(
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
+        "--num_vectors",
+        type=int,
+        default=1,
+        help="How many textual inversion vectors shall be used to learn the concept.",
+    )
+    parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default=None,
@@ -229,6 +235,16 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help=("A folder containing the training data. "),
+    )
+    parser.add_argument(
+        "--placeholder_token",
+        type=str,
+        default=None,
+        required=True,
+        help="A token to use as a placeholder for the concept.",
+    )
+    parser.add_argument(
+        "--initializer_token", type=str, default=None, required=True, help="A token to use as initializer word."
     )
 
     parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
@@ -269,12 +285,6 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--rank",
-        type=int,
-        default=4,
-        help=("The dimension of the LoRA update matrices."),
-    )
-    parser.add_argument(
         "--output_dir",
         type=str,
         default="sd3-dreambooth",
@@ -307,9 +317,6 @@ def parse_args(input_args=None):
 
     parser.add_argument(
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
-    )
-    parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -624,9 +631,6 @@ def _encode_prompt_with_t5(
 
     prompt_embeds = text_encoder(text_input_ids.to(device))[0]
 
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
     _, seq_len, _ = prompt_embeds.shape
 
     # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
@@ -665,7 +669,6 @@ def _encode_prompt_with_clip(
 
     pooled_prompt_embeds = prompt_embeds[0]
     prompt_embeds = prompt_embeds.hidden_states[-2]
-    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
 
     _, seq_len, _ = prompt_embeds.shape
     # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -924,7 +927,7 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    vae.to(accelerator.device, dtype=torch.float32)
+    vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
@@ -944,6 +947,12 @@ def main(args):
         args.learning_rate = (
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
+
+    # Make sure the trainable params are in float32.
+    if args.mixed_precision == "fp16":
+        text_encoder_one.text_model.embeddings.token_embedding.weight.data = text_encoder_one.text_model.embeddings.token_embedding.weight.to(torch.float32)
+        text_encoder_two.text_model.embeddings.token_embedding.weight.data = text_encoder_two.text_model.embeddings.token_embedding.weight.to(torch.float32)
+        text_encoder_three.shared.weight.data = text_encoder_three.shared.weight.to(torch.float32)
 
     if args.use_8bit_adam:
         try:
@@ -1165,9 +1174,8 @@ def main(args):
                 )
 
                 # Convert images to latent space
-                model_input = vae.encode(pixel_values).latent_dist.sample()
+                model_input = vae.encode(pixel_values).latent_dist.sample().detach()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
-                model_input = model_input.to(dtype=weight_dtype)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -1194,8 +1202,8 @@ def main(args):
                 model_pred = transformer(
                     hidden_states=noisy_model_input,
                     timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds.to(dtype=weight_dtype),
+                    pooled_projections=pooled_prompt_embeds.to(dtype=weight_dtype),
                     return_dict=False,
                 )[0]
 
@@ -1232,7 +1240,7 @@ def main(args):
                 index_no_updates[min(placeholder_token_ids): max(placeholder_token_ids) + 1] = False
                 index_no_updates_2 = torch.ones((len(tokenizer_two),), dtype=torch.bool)
                 index_no_updates_2[min(placeholder_token_ids_2): max(placeholder_token_ids_2) + 1] = False
-                index_no_updates_3 = torch.ones((len(tokenizer_three),), dtype=torch.bool)
+                index_no_updates_3 = torch.ones((orig_embeds_params_3.size(0),), dtype=torch.bool)
                 index_no_updates_3[min(placeholder_token_ids_3): max(placeholder_token_ids_3) + 1] = False
 
                 with torch.no_grad():
