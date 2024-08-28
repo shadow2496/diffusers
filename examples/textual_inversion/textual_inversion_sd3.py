@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import PIL
+import safetensors
 import torch
 import torch.utils.checkpoint
 import transformers
@@ -92,6 +93,19 @@ check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)
 
 
+def save_progress(text_encoder, placeholder_tokens, placeholder_token_ids, accelerator, save_path, safe_serialization=True):
+    logger.info("Saving embeddings")
+    learned_embeds_dict = {}
+    for placeholder_token, placeholder_token_id in zip(placeholder_tokens, placeholder_token_ids):
+        learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[placeholder_token_id]
+        learned_embeds_dict[placeholder_token] = learned_embeds.detach().cpu()
+
+    if safe_serialization:
+        safetensors.torch.save_file(learned_embeds_dict, save_path, metadata={"format": "pt"})
+    else:
+        torch.save(learned_embeds_dict, save_path)
+
+
 def load_text_encoders(class_one, class_two, class_three):
     text_encoder_one = class_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -103,83 +117,6 @@ def load_text_encoders(class_one, class_two, class_three):
         args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
     )
     return text_encoder_one, text_encoder_two, text_encoder_three
-
-
-def log_validation(
-    pipeline,
-    args,
-    accelerator,
-    pipeline_args,
-    step,
-    is_final_validation=False,
-):
-    logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    # run inference
-    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
-    # autocast_ctx = nullcontext()
-
-    with open('{}.txt'.format(args.instance_data_dir), "r") as f:
-        prompts = f.read().splitlines()
-    idx = 0
-    for prompt in prompts:
-        prompt = prompt.lower()
-        text = prompt.replace('<new1> ', '').replace(' <new1>', '')
-        prompt = prompt.replace('<new1>', 'sks')
-        with autocast_ctx:
-            images = [pipeline(**pipeline_args, prompt=prompt, generator=generator).images[0] for _ in range(args.num_validation_images)]
-
-        save_dir = os.path.join(args.output_dir, 'outputs', '{}_{}'.format('{:02d}'.format(idx), prompt.replace(' ', '-')))
-        os.makedirs(save_dir, exist_ok=True)
-        for j, image in enumerate(images):
-            image.save(os.path.join(save_dir, '{:04d}_image{}_{}_.png'.format(step, j, text)))
-
-        images_tensor = [transforms.ToTensor()(image) for image in images]
-        grid = torch.stack(images_tensor, 0)
-        grid = make_grid(grid, nrow=args.num_validation_images)
-        transforms.ToPILImage()(grid).save(os.path.join(save_dir, '{:04d}_all.jpg'.format(step)))
-        idx += 1
-
-    del pipeline
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    def save_new_images(outputs_dir, dirnames, filenames, new_dirname, idx_list):
-        os.makedirs(os.path.join(outputs_dir, new_dirname), exist_ok=True)
-        for filename in filenames:
-            if 'all.jpg' not in filename or os.path.exists(os.path.join(outputs_dir, new_dirname, filename)):
-                continue
-
-            new_img = Image.new('RGB', (514 * args.num_validation_images + 2, 516 * len(idx_list)))
-            for i, idx in enumerate(idx_list):
-                try:
-                    img = Image.open(os.path.join(outputs_dir, dirnames[idx], filename))
-                except:
-                    return
-                new_img.paste(img, (0, 516 * i))
-                if '0000' in filename:
-                    print('{} is opened'.format(os.path.join(outputs_dir, dirnames[idx], filename)))
-
-            new_img.save(os.path.join(outputs_dir, new_dirname, filename))
-            print('{} is saved'.format(os.path.join(outputs_dir, new_dirname, filename)))
-        print()
-    outputs_dir = os.path.join(args.output_dir, 'outputs')
-    dirnames_temp = sorted(os.listdir(outputs_dir))
-    dirnames = []
-    for dirname in dirnames_temp:
-        if '_clipseg' not in dirname:
-            dirnames.append(dirname)
-    # dirnames = sorted(os.listdir(outputs_dir))
-    filenames = sorted(os.listdir(os.path.join(outputs_dir, dirnames[0])))
-    save_new_images(outputs_dir, dirnames, filenames, 'all_00-{:02d}'.format(idx - 1), range(idx))
-
-    return images
 
 
 def import_model_class_from_model_name_or_path(
@@ -203,6 +140,12 @@ def import_model_class_from_model_name_or_path(
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,
+        help="Save learned_embeds.bin every X updates steps.",
+    )
     parser.add_argument(
         "--num_vectors",
         type=int,
@@ -328,7 +271,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=10000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
             " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
@@ -1053,42 +996,6 @@ def main(args):
         tracker_name = "dreambooth-sd3-lora"
         accelerator.init_trackers(tracker_name, config=vars(args))
 
-        # val_latents = torch.load(args.val_latents_checkpoint).to(dtype=weight_dtype)  # TODO: val_latents 사용하도록 수정
-        # # val_latents = torch.randn(8, 16, 128, 128, dtype=torch.float16)
-        #
-        # # create pipeline
-        # if not args.train_text_encoder:
-        #     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
-        #         text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
-        #     )
-        # pipeline = StableDiffusion3Pipeline.from_pretrained(
-        #     args.pretrained_model_name_or_path,
-        #     # vae=vae,  # TODO: 어떤 module이 memory를 일반적인 inference 때보다 과도하게 차지하는지 점검
-        #     # text_encoder=accelerator.unwrap_model(text_encoder_one),
-        #     # text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-        #     # text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-        #     # transformer=accelerator.unwrap_model(transformer),
-        #     revision=args.revision,
-        #     variant=args.variant,
-        #     torch_dtype=weight_dtype,
-        # )
-        # pipeline_args = {
-        #     # "prompt": args.validation_prompt,
-        #     "num_inference_steps": 28,  # TODO: 왜 default값이 28인지 확인
-        #     "guidance_scale": 7.0,  # TODO: 왜 default값이 7.0인지 확인
-        # }
-        # images = log_validation(
-        #     pipeline=pipeline,
-        #     args=args,
-        #     accelerator=accelerator,
-        #     pipeline_args=pipeline_args,
-        #     step=0,
-        # )
-        # if not args.train_text_encoder:
-        #     del text_encoder_one, text_encoder_two, text_encoder_three
-        #     torch.cuda.empty_cache()
-        #     gc.collect()
-
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1260,39 +1167,37 @@ def main(args):
                 global_step += 1
 
                 if accelerator.is_main_process:
-                    # if global_step % args.validation_steps == 0:
-                    #     # create pipeline
-                    #     if not args.train_text_encoder:
-                    #         text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
-                    #             text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
-                    #         )
-                    #     pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    #         args.pretrained_model_name_or_path,
-                    #         vae=vae,
-                    #         text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    #         text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    #         text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                    #         transformer=accelerator.unwrap_model(transformer),
-                    #         revision=args.revision,
-                    #         variant=args.variant,
-                    #         torch_dtype=weight_dtype,
-                    #     )
-                    #     pipeline_args = {
-                    #         # "prompt": args.validation_prompt,
-                    #         "num_inference_steps": 28,  # TODO: 왜 default값이 28인지 확인
-                    #         "guidance_scale": 7.0,  # TODO: 왜 default값이 7.0인지 확인
-                    #     }
-                    #     images = log_validation(
-                    #         pipeline=pipeline,
-                    #         args=args,
-                    #         accelerator=accelerator,
-                    #         pipeline_args=pipeline_args,
-                    #         step=global_step,
-                    #     )
-                    #     if not args.train_text_encoder:
-                    #         del text_encoder_one, text_encoder_two, text_encoder_three
-                    #         torch.cuda.empty_cache()
-                    #         gc.collect()
+                    if global_step % args.save_steps == 0:
+                        weight_name = f"learned_embeds-steps-{global_step:04d}.safetensors"
+                        save_path = os.path.join(args.output_dir, weight_name)
+                        save_progress(
+                            text_encoder_one,
+                            placeholder_tokens,
+                            placeholder_token_ids,
+                            accelerator,
+                            save_path,
+                            safe_serialization=True,
+                        )
+                        weight_name = f"learned_embeds_2-steps-{global_step:04d}.safetensors"
+                        save_path = os.path.join(args.output_dir, weight_name)
+                        save_progress(
+                            text_encoder_two,
+                            placeholder_tokens,
+                            placeholder_token_ids_2,
+                            accelerator,
+                            save_path,
+                            safe_serialization=True,
+                        )
+                        weight_name = f"learned_embeds_3-steps-{global_step:04d}.safetensors"
+                        save_path = os.path.join(args.output_dir, weight_name)
+                        save_progress(
+                            text_encoder_three,
+                            placeholder_tokens,
+                            placeholder_token_ids_3,
+                            accelerator,
+                            save_path,
+                            safe_serialization=True,
+                        )
 
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
