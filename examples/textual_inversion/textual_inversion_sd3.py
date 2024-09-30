@@ -947,10 +947,11 @@ def main(args):
     # have to pass them to the dataloader.
 
     # batch prompts on all training steps
-    tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
-    tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
+    instance_prompt = args.instance_prompt.replace('<new1>', ' '.join(placeholder_tokens))
+    tokens_one = tokenize_prompt(tokenizer_one, instance_prompt)
+    tokens_two = tokenize_prompt(tokenizer_two, instance_prompt)
     # Not used
-    # tokens_three = tokenize_prompt(tokenizer_three, args.instance_prompt)
+    # tokens_three = tokenize_prompt(tokenizer_three, instance_prompt)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1079,7 +1080,7 @@ def main(args):
                 prompt_embeds, pooled_prompt_embeds = encode_prompt(
                     text_encoders=[text_encoder_one, text_encoder_two, text_encoder_three],
                     tokenizers=[None, None, tokenizer_three],
-                    prompt=args.instance_prompt,
+                    prompt=instance_prompt,
                     max_sequence_length=args.max_sequence_length,
                     text_input_ids_list=[tokens_one, tokens_two, None],
                 )
