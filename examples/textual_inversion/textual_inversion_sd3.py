@@ -311,6 +311,16 @@ def parse_args(input_args=None):
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
+        "--lr_text_encoder_two_scale",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--lr_text_encoder_three_scale",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
         "--scale_lr",
         action="store_true",
         default=False,
@@ -916,9 +926,9 @@ def main(args):
     optimizer = optimizer_class(
         # only optimize the embeddings
         [
-            text_encoder_one.text_model.embeddings.token_embedding.weight,
-            text_encoder_two.text_model.embeddings.token_embedding.weight,
-            text_encoder_three.shared.weight,
+            {'params': text_encoder_one.text_model.embeddings.token_embedding.weight},
+            {'params': text_encoder_two.text_model.embeddings.token_embedding.weight, 'lr': args.learning_rate * args.lr_text_encoder_two_scale},
+            {'params': text_encoder_three.shared.weight, 'lr': args.learning_rate * args.lr_text_encoder_three_scale},
         ],
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
