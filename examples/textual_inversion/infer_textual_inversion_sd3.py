@@ -168,7 +168,14 @@ def main():
                 ).images
 
             for j, image in enumerate(images):
-                image.save(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i + j, text)))
+                while True:
+                    try:
+                        image.save(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i + j, text)))
+                        break
+                    except:
+                        if not is_too_long:
+                            raise
+                        text = text[1:]
                 if args.save_grid:
                     images_tensor.append(transforms.ToTensor()(image))
 
@@ -181,7 +188,7 @@ def main():
         dirnames = [path.split('/')[-2] for path in sorted(glob(os.path.join(args.save_dir, '??_*{}/'.format(suffix))))]
         save_new_image(args, dirnames, 'all_00-{:02d}{}.jpg'.format(len(dirnames) - 1, suffix))
 
-    if is_too_long:
+    if args.from_file and is_too_long:
         split = args.save_dir.split('/')
         split[-2] = '{}_too_long'.format(split[-2])
         shutil.move(args.save_dir, '/'.join(split))
