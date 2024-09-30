@@ -271,7 +271,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=10000,
+        default=100000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
             " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
@@ -717,8 +717,12 @@ def main(args):
 
     # If passed along, set the training seed now.
     if args.seed is not None:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         set_seed(args.seed, device_specific=True)
-        torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.enabled = False
+        # torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
+        # torch.backends.cudnn.benchmark = False
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -1040,7 +1044,7 @@ def main(args):
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
-        position=1,
+        # position=1,
         initial=initial_global_step,
         desc="Steps",
         # Only show the progress bar once on each machine.
