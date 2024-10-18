@@ -2,10 +2,11 @@ import argparse
 from glob import glob
 import os
 import shutil
+from textwrap import fill
 
 from diffusers import StableDiffusion3Pipeline
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import safetensors
 import torch
 from torchvision import transforms
@@ -67,14 +68,12 @@ def parse_args():
 
 
 def save_new_image(args, dirnames, new_filename):
-    new_img = Image.new('RGB', (1024 * args.n_samples, 1024 * len(dirnames)))
+    new_img = Image.new('RGB', (1024 * (args.n_samples + 1), 1024 * len(dirnames)))
     for i, dirname in enumerate(dirnames):
-        filenames = [f for f in sorted(os.listdir(os.path.join(args.save_dir, dirname))) if f.endswith('.png')]
-        for j, filename in enumerate(filenames):
-            img = Image.open(os.path.join(args.save_dir, dirname, filename))
-            new_img.paste(img, (1024 * j, 1024 * i))
-            if 'image000' in filename:
-                print('{} is opened'.format(os.path.join(dirname, filename)))
+        filename = 'all_with_text.jpg'
+        img = Image.open(os.path.join(args.save_dir, dirname, filename))
+        new_img.paste(img, (0, 1024 * i))
+        print('{} is opened'.format(os.path.join(dirname, filename)))
 
     new_img.save('{}_{}'.format(args.save_dir[:-1], new_filename))
     print('{} is saved'.format(new_filename))
@@ -121,8 +120,12 @@ def main():
     if args.latents_checkpoint:
         latents = torch.load(args.latents_checkpoint)
 
+    font_path = os.path.join(args.model_dir.split('seunghwan')[0], 'seunghwan/anaconda3/envs/diffuser-py3.8-cuda11.3-torch1.10-eval/lib/python3.8/site-packages/cv2/qt/fonts/DejaVuSans.ttf')
+    font = ImageFont.truetype(font_path, size=48)
+
     is_too_long = False
     for idx, prompt in tqdm(enumerate(data), position=1, desc='data'):
+        orig_prompt = prompt
         text = prompt.replace('<new1> ', '').replace(' <new1>', '')
         prompt = prompt.replace('<new1>', placeholder_token)
 
@@ -182,11 +185,18 @@ def main():
         if args.save_grid:
             grid = torch.stack(images_tensor, 0)
             grid = make_grid(grid, nrow=args.n_samples)
-            transforms.ToPILImage()(grid).save(os.path.join(save_dir, 'all.jpg'))
+            img = transforms.ToPILImage()(grid)
+
+            new_img = Image.new('RGB', (1024 * (args.n_samples + 1), 1024), color='white')
+            new_img.paste(img, (0, 0))
+
+            draw = ImageDraw.Draw(new_img)
+            draw.text((1024 * args.n_samples + 512, 512), fill(orig_prompt, width=35), fill='black', font=font, anchor='mm')
+            new_img.save(os.path.join(save_dir, 'all_with_text.jpg'))
 
     if args.from_file:
         dirnames = [path.split('/')[-2] for path in sorted(glob(os.path.join(args.save_dir, '??_*{}/'.format(suffix))))]
-        save_new_image(args, dirnames, 'all_00-{:02d}{}.jpg'.format(len(dirnames) - 1, suffix))
+        save_new_image(args, dirnames, 'all_with_text_00-{:02d}{}.jpg'.format(len(dirnames) - 1, suffix))
 
     if args.from_file and is_too_long:
         split = args.save_dir.split('/')
