@@ -27,6 +27,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
+import safetensors
 import torch
 import torch.utils.checkpoint
 import transformers
@@ -77,81 +78,17 @@ check_min_version("0.30.0.dev0")
 logger = get_logger(__name__)
 
 
-def save_model_card(
-    repo_id: str,
-    images=None,
-    base_model: str = None,
-    train_text_encoder=False,
-    instance_prompt=None,
-    validation_prompt=None,
-    repo_folder=None,
-):
-    widget_dict = []
-    if images is not None:
-        for i, image in enumerate(images):
-            image.save(os.path.join(repo_folder, f"image_{i}.png"))
-            widget_dict.append(
-                {"text": validation_prompt if validation_prompt else " ", "output": {"url": f"image_{i}.png"}}
-            )
+def save_progress(text_encoder, placeholder_tokens, placeholder_token_ids, accelerator, save_path, safe_serialization=True):
+    logger.info("Saving embeddings")
+    learned_embeds_dict = {}
+    for placeholder_token, placeholder_token_id in zip(placeholder_tokens, placeholder_token_ids):
+        learned_embeds = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[placeholder_token_id]
+        learned_embeds_dict[placeholder_token] = learned_embeds.detach().cpu()
 
-    model_description = f"""
-# Flux DreamBooth LoRA - {repo_id}
-
-<Gallery />
-
-## Model description
-
-These are {repo_id} DreamBooth LoRA weights for {base_model}.
-
-The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [Flux diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_flux.md).
-
-Was LoRA for the text encoder enabled? {train_text_encoder}.
-
-## Trigger words
-
-You should use `{instance_prompt}` to trigger the image generation.
-
-## Download model
-
-[Download the *.safetensors LoRA]({repo_id}/tree/main) in the Files & versions tab.
-
-## Use it with the [🧨 diffusers library](https://github.com/huggingface/diffusers)
-
-```py
-from diffusers import AutoPipelineForText2Image
-import torch
-pipeline = AutoPipelineForText2Image.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.bfloat16).to('cuda')
-pipeline.load_lora_weights('{repo_id}', weight_name='pytorch_lora_weights.safetensors')
-image = pipeline('{validation_prompt if validation_prompt else instance_prompt}').images[0]
-```
-
-For more details, including weighting, merging and fusing LoRAs, check the [documentation on loading LoRAs in diffusers](https://huggingface.co/docs/diffusers/main/en/using-diffusers/loading_adapters)
-
-## License
-
-Please adhere to the licensing terms as described [here](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md).
-"""
-    model_card = load_or_create_model_card(
-        repo_id_or_path=repo_id,
-        from_training=True,
-        license="other",
-        base_model=base_model,
-        prompt=instance_prompt,
-        model_description=model_description,
-        widget=widget_dict,
-    )
-    tags = [
-        "text-to-image",
-        "diffusers-training",
-        "diffusers",
-        "lora",
-        "flux",
-        "flux-diffusers",
-        "template:sd-lora",
-    ]
-
-    model_card = populate_model_card(model_card, tags=tags)
-    model_card.save(os.path.join(repo_folder, "README.md"))
+    if safe_serialization:
+        safetensors.torch.save_file(learned_embeds_dict, save_path, metadata={"format": "pt"})
+    else:
+        torch.save(learned_embeds_dict, save_path)
 
 
 def load_text_encoders(class_one, class_two):
@@ -162,50 +99,6 @@ def load_text_encoders(class_one, class_two):
         args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
     )
     return text_encoder_one, text_encoder_two
-
-
-def log_validation(
-    pipeline,
-    args,
-    accelerator,
-    pipeline_args,
-    epoch,
-    is_final_validation=False,
-):
-    logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    # run inference
-    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    # autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
-    autocast_ctx = nullcontext()
-
-    with autocast_ctx:
-        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
-
-    for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
-        if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
-                    ]
-                }
-            )
-
-    del pipeline
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    return images
 
 
 def import_model_class_from_model_name_or_path(
@@ -229,6 +122,12 @@ def import_model_class_from_model_name_or_path(
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=500,
+        help="Save learned_embeds.bin every X updates steps.",
+    )
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -322,6 +221,7 @@ def parse_args(input_args=None):
         default=512,
         help="Maximum sequence length to use with with the T5 text encoder",
     )
+    parser.add_argument('--val_latents_checkpoint', type=str, default='./outputs/val_latents_s0023.pt')
     parser.add_argument(
         "--validation_prompt",
         type=str,
@@ -335,7 +235,7 @@ def parse_args(input_args=None):
         help="Number of images that should be generated during validation with `validation_prompt`.",
     )
     parser.add_argument(
-        "--validation_epochs",
+        "--validation_steps",
         type=int,
         default=50,
         help=(
@@ -416,7 +316,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=100000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
             " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
@@ -1729,6 +1629,28 @@ def main(args):
                 global_step += 1
 
                 if accelerator.is_main_process:
+                    if global_step % args.save_steps == 0:
+                        weight_name = f"learned_embeds-steps-{global_step:04d}.safetensors"
+                        save_path = os.path.join(args.output_dir, weight_name)
+                        save_progress(
+                            text_encoder_one,
+                            placeholder_tokens,
+                            placeholder_token_ids,
+                            accelerator,
+                            save_path,
+                            safe_serialization=True,
+                        )
+                        weight_name = f"learned_embeds_2-steps-{global_step:04d}.safetensors"
+                        save_path = os.path.join(args.output_dir, weight_name)
+                        save_progress(
+                            text_encoder_two,
+                            placeholder_tokens,
+                            placeholder_token_ids_2,
+                            accelerator,
+                            save_path,
+                            safe_serialization=True,
+                        )
+
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
@@ -1750,7 +1672,7 @@ def main(args):
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
                                     shutil.rmtree(removing_checkpoint)
 
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step:04d}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
@@ -1761,94 +1683,7 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                # create pipeline
-                if not args.train_text_encoder:
-                    text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
-                pipeline = FluxPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                    transformer=accelerator.unwrap_model(transformer),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                pipeline_args = {"prompt": args.validation_prompt}
-                images = log_validation(
-                    pipeline=pipeline,
-                    args=args,
-                    accelerator=accelerator,
-                    pipeline_args=pipeline_args,
-                    epoch=epoch,
-                )
-                if not args.train_text_encoder:
-                    del text_encoder_one, text_encoder_two
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
-    # Save the lora layers
     accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        transformer = unwrap_model(transformer)
-        transformer = transformer.to(torch.float32)
-        transformer_lora_layers = get_peft_model_state_dict(transformer)
-
-        if args.train_text_encoder:
-            text_encoder_one = unwrap_model(text_encoder_one)
-            text_encoder_lora_layers = get_peft_model_state_dict(text_encoder_one.to(torch.float32))
-        else:
-            text_encoder_lora_layers = None
-
-        FluxPipeline.save_lora_weights(
-            save_directory=args.output_dir,
-            transformer_lora_layers=transformer_lora_layers,
-            text_encoder_lora_layers=text_encoder_lora_layers,
-        )
-
-        # Final inference
-        # Load previous pipeline
-        pipeline = FluxPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
-        # load attention processors
-        pipeline.load_lora_weights(args.output_dir)
-
-        # run inference
-        images = []
-        if args.validation_prompt and args.num_validation_images > 0:
-            pipeline_args = {"prompt": args.validation_prompt}
-            images = log_validation(
-                pipeline=pipeline,
-                args=args,
-                accelerator=accelerator,
-                pipeline_args=pipeline_args,
-                epoch=epoch,
-                is_final_validation=True,
-            )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                images=images,
-                base_model=args.pretrained_model_name_or_path,
-                train_text_encoder=args.train_text_encoder,
-                instance_prompt=args.instance_prompt,
-                validation_prompt=args.validation_prompt,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
-
     accelerator.end_training()
 
 
