@@ -48,6 +48,7 @@ from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 import diffusers
 from diffusers import (
     AutoencoderKL,
+    BitsAndBytesConfig,
     FlowMatchEulerDiscreteScheduler,
     FluxPipeline,
     FluxTransformer2DModel,
@@ -761,8 +762,23 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
+
+    # For mixed precision training we cast all non-trainable weights (vae, text_encoder and transformer) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    nf4_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=weight_dtype
+    )
     transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant,
+        quantization_config=nf4_config, torch_dtype=weight_dtype,
     )
 
     # Add the placeholder token in tokenizer_1
@@ -828,14 +844,6 @@ def main(args):
     text_encoder_two.encoder.final_layer_norm.requires_grad_(False)
     text_encoder_two.encoder.dropout.requires_grad_(False)
 
-    # For mixed precision training we cast all non-trainable weights (vae, text_encoder and transformer) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-
     if torch.backends.mps.is_available() and weight_dtype == torch.bfloat16:
         # due to pytorch#99272, MPS does not yet support bfloat16.
         raise ValueError(
@@ -843,7 +851,7 @@ def main(args):
         )
 
     vae.to(accelerator.device, dtype=weight_dtype)
-    transformer.to(accelerator.device, dtype=weight_dtype)
+    transformer.to(accelerator.device)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
