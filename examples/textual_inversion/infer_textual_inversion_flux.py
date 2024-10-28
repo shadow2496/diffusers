@@ -1,0 +1,219 @@
+import argparse
+from glob import glob
+import os
+import shutil
+from textwrap import fill
+
+from diffusers import BitsAndBytesConfig, FluxPipeline, FluxTransformer2DModel
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import safetensors
+import torch
+from torchvision import transforms
+from torchvision.utils import make_grid
+from tqdm import tqdm
+
+
+def load_model(text_encoder, tokenizer, save_path, resize_token_embeddings=True):
+    st = safetensors.torch.load_file(save_path)
+    placeholder_tokens = list(st.keys())
+    print(placeholder_tokens)
+
+    placeholder_token_ids = []
+    for placeholder_token in placeholder_tokens:
+        _ = tokenizer.add_tokens(placeholder_token)
+        placeholder_token_ids.append(tokenizer.convert_tokens_to_ids(placeholder_token))
+
+    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+    if resize_token_embeddings:
+        text_encoder.resize_token_embeddings(len(tokenizer))
+    token_embeds = text_encoder.get_input_embeddings().weight.data
+    for placeholder_token, placeholder_token_id in zip(placeholder_tokens, placeholder_token_ids):
+        token_embeds[placeholder_token_id] = st[placeholder_token]
+
+    return ' '.join(placeholder_tokens)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_dir', type=str, default='FLUX.1-dev-0ef5fff/', help='path to saved model')
+    parser.add_argument('--lora_ckpt', type=str, required=True)
+    parser.add_argument('--save_dir', type=str, required=True)
+    parser.add_argument(
+        "--from_file",
+        type=str,
+        help="if specified, load prompts from this file",
+    )
+    parser.add_argument('--prompt', type=str)
+
+    parser.add_argument('-b', '--batch_size', type=int, default=1)
+    parser.add_argument('--n_samples', type=int, default=8)
+    parser.add_argument('--save_grid', action='store_true')
+
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        required=False,
+        help="Revision of pretrained model identifier from huggingface.co/models.",
+    )
+
+    parser.add_argument('--n_steps', type=int, default=50)
+    parser.add_argument('--scale', type=float, default=3.5)  # TODO: 왜 default값이 3.5인지 확인
+    parser.add_argument('--latents_checkpoint', type=str, default=None)
+
+    args = parser.parse_args()
+    return args
+
+
+def save_new_image(args, dirnames, new_filename):
+    new_img = Image.new('RGB', (1024 * (args.n_samples + 1), 1024 * len(dirnames)))
+    for i, dirname in enumerate(dirnames):
+        filename = 'all_with_text.jpg'
+        img = Image.open(os.path.join(args.save_dir, dirname, filename))
+        new_img.paste(img, (0, 1024 * i))
+        print('{} is opened'.format(os.path.join(dirname, filename)))
+
+    new_img.save('{}_{}'.format(args.save_dir[:-1], new_filename))
+    print('{} is saved'.format(new_filename))
+    print()
+
+
+def main():
+    args = parse_args()
+
+    # nf4_config = BitsAndBytesConfig(
+    #     load_in_4bit=True,
+    #     bnb_4bit_quant_type="nf4",
+    #     bnb_4bit_compute_dtype=torch.bfloat16
+    # )
+    # transformer = FluxTransformer2DModel.from_pretrained(
+    #     args.model_dir, subfolder="transformer", revision=args.revision,
+    #     quantization_config=nf4_config, torch_dtype=torch.bfloat16,
+    # )
+
+    pipe = FluxPipeline.from_pretrained(
+        args.model_dir, torch_dtype=torch.bfloat16, revision=args.revision,
+        # transformer=transformer,
+    ).to("cuda")
+    # pipe.load_lora_weights(args.lora_ckpt)
+    placeholder_token = load_model(pipe.text_encoder, pipe.tokenizer, args.lora_ckpt)
+    load_model(pipe.text_encoder_2, pipe.tokenizer_2, args.lora_ckpt.replace('embeds', 'embeds_2'), resize_token_embeddings=False)
+
+    if args.seed:
+        print(f"Global seed set to {args.seed}")
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+
+    if not args.from_file:
+        prompt = args.prompt
+        assert prompt is not None
+        data = [prompt.lower()]
+    else:
+        print(f"reading prompts from {args.from_file}")
+        with open(args.from_file, "r") as f:
+            data = f.read().splitlines()
+            data = [d.strip("\n").split("\t")[0] for d in data]
+            data = [d.lower() for d in data]
+
+    suffix = ''
+    if args.scale != 3.5:
+        suffix = '{}_cfg{:04.1f}'.format(suffix, args.scale)
+    if args.n_steps != 50:
+        suffix = '{}_step{:03d}'.format(suffix, args.n_steps)
+    suffix = '{}_s{:04d}_{:03d}'.format(suffix, args.seed, args.n_samples)
+    if args.latents_checkpoint:
+        suffix = '{}_val'.format(suffix)
+
+    if args.latents_checkpoint:
+        latents = torch.load(args.latents_checkpoint)
+        latents = latents.view(8, 16, 128 // 2, 2, 128 // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(8, (128 // 2) * (128 // 2), 16 * 4)
+
+    font_path = os.path.join(args.model_dir.split('seunghwan')[0], 'seunghwan/anaconda3/envs/diffuser-py3.8-cuda11.3-torch1.10-eval/lib/python3.8/site-packages/cv2/qt/fonts/DejaVuSans.ttf')
+    font = ImageFont.truetype(font_path, size=48)
+
+    is_too_long = False
+    for idx, prompt in tqdm(enumerate(data), position=1, desc='data'):
+        orig_prompt = prompt
+        text = prompt.replace('<new1> ', '').replace(' <new1>', '')
+        prompt = prompt.replace('<new1>', placeholder_token)
+
+        if not args.from_file:
+            save_dir = os.path.join(args.save_dir, '{}{}'.format(prompt.replace(' ', '-'), suffix))
+        else:
+            save_dir = os.path.join(args.save_dir, '{:02d}_{}{}'.format(idx, prompt.replace(' ', '-'), suffix))
+        while True:
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                break
+            except:
+                is_too_long = True
+                split = save_dir.split('/')
+                if not args.from_file:
+                    split[-1] = split[-1][1:]
+                else:
+                    split[-1] = '{:02d}_{}'.format(idx, split[-1][4:])
+                save_dir = '/'.join(split)
+
+        if args.save_grid:
+            images_tensor = []
+        for i in range(0, args.n_samples, args.batch_size):
+            prompts = [prompt for _ in range(min(args.batch_size, args.n_samples - i))]
+            if args.latents_checkpoint and i + args.batch_size <= latents.size(0):
+                images = pipe(
+                    prompt=prompts,
+                    num_inference_steps=args.n_steps,
+                    height=1024,
+                    width=1024,
+                    guidance_scale=args.scale,
+                    latents=latents[i:i + args.batch_size],
+                ).images
+            else:
+                images = pipe(
+                    prompt=prompts,
+                    num_inference_steps=args.n_steps,
+                    height=1024,
+                    width=1024,
+                    guidance_scale=args.scale,
+                ).images
+
+            for j, image in enumerate(images):
+                while True:
+                    try:
+                        image.save(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i + j, text)))
+                        break
+                    except:
+                        if not is_too_long:
+                            raise
+                        text = text[1:]
+                if args.save_grid:
+                    images_tensor.append(transforms.ToTensor()(image))
+
+        if args.save_grid:
+            grid = torch.stack(images_tensor, 0)
+            grid = make_grid(grid, nrow=args.n_samples)
+            img = transforms.ToPILImage()(grid)
+
+            new_img = Image.new('RGB', (1024 * (args.n_samples + 1), 1024), color='white')
+            new_img.paste(img, (0, 0))
+
+            draw = ImageDraw.Draw(new_img)
+            draw.text((1024 * args.n_samples + 512, 512), fill(orig_prompt, width=35), fill='black', font=font, anchor='mm')
+            new_img.save(os.path.join(save_dir, 'all_with_text.jpg'))
+
+    if args.from_file:
+        dirnames = [path.split('/')[-2] for path in sorted(glob(os.path.join(args.save_dir, '??_*{}/'.format(suffix))))]
+        save_new_image(args, dirnames, 'all_with_text_00-{:02d}{}.jpg'.format(len(dirnames) - 1, suffix))
+
+    # if args.from_file and is_too_long:
+    #     split = args.save_dir.split('/')
+    #     split[-2] = '{}_too_long'.format(split[-2])
+    #     shutil.move(args.save_dir, '/'.join(split))
+
+
+if __name__ == '__main__':
+    main()
