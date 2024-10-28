@@ -159,39 +159,52 @@ def main():
                     split[-1] = '{:02d}_{}'.format(idx, split[-1][4:])
                 save_dir = '/'.join(split)
 
+        if '<new' not in prompt:
+            orig_save_dir = save_dir
+            split = save_dir.split('/')
+            split[-2] = split[-2].split('_init')[0].split('_reg')[0].split('_cosreg')[0]
+            save_dir = '/'.join(split)
+            os.makedirs(save_dir, exist_ok=True)
+            print(f"save_dir: {save_dir}")
+
         if args.save_grid:
             images_tensor = []
-        for i in range(0, args.n_samples, args.batch_size):
-            prompts = [prompt for _ in range(min(args.batch_size, args.n_samples - i))]
-            if args.latents_checkpoint and i + args.batch_size <= latents.size(0):
-                images = pipe(
-                    prompt=prompts,
-                    num_inference_steps=args.n_steps,
-                    height=1024,
-                    width=1024,
-                    guidance_scale=args.scale,
-                    latents=latents[i:i + args.batch_size],
-                ).images
-            else:
-                images = pipe(
-                    prompt=prompts,
-                    num_inference_steps=args.n_steps,
-                    height=1024,
-                    width=1024,
-                    guidance_scale=args.scale,
-                ).images
+        if len(glob(os.path.join(save_dir, 'image*'))) != args.n_samples:
+            for i in range(0, args.n_samples, args.batch_size):
+                prompts = [prompt for _ in range(min(args.batch_size, args.n_samples - i))]
+                if args.latents_checkpoint and i + args.batch_size <= latents.size(0):
+                    images = pipe(
+                        prompt=prompts,
+                        num_inference_steps=args.n_steps,
+                        height=1024,
+                        width=1024,
+                        guidance_scale=args.scale,
+                        latents=latents[i:i + args.batch_size],
+                    ).images
+                else:
+                    images = pipe(
+                        prompt=prompts,
+                        num_inference_steps=args.n_steps,
+                        height=1024,
+                        width=1024,
+                        guidance_scale=args.scale,
+                    ).images
 
-            for j, image in enumerate(images):
-                while True:
-                    try:
-                        image.save(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i + j, text)))
-                        break
-                    except:
-                        if not is_too_long:
-                            raise
-                        text = text[1:]
-                if args.save_grid:
-                    images_tensor.append(transforms.ToTensor()(image))
+                for j, image in enumerate(images):
+                    while True:
+                        try:
+                            image.save(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i + j, text)))
+                            break
+                        except:
+                            if not is_too_long:
+                                raise
+                            text = text[1:]
+                    if args.save_grid:
+                        images_tensor.append(transforms.ToTensor()(image))
+        elif len(glob(os.path.join(save_dir, 'image*'))) == args.n_samples and args.save_grid:
+            for i in range(args.n_samples):
+                image = Image.open(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i, text)))
+                images_tensor.append(transforms.ToTensor()(image))
 
         if args.save_grid:
             grid = torch.stack(images_tensor, 0)
@@ -204,6 +217,10 @@ def main():
             draw = ImageDraw.Draw(new_img)
             draw.text((1024 * args.n_samples + 512, 512), fill(orig_prompt, width=35), fill='black', font=font, anchor='mm')
             new_img.save(os.path.join(save_dir, 'all_with_text.jpg'))
+
+        if '<new' not in prompt:
+            os.rmdir(orig_save_dir)
+            shutil.copytree(save_dir, orig_save_dir)
 
     if args.from_file:
         dirnames = [path.split('/')[-2] for path in sorted(glob(os.path.join(args.save_dir, '??_*{}/'.format(suffix))))]
