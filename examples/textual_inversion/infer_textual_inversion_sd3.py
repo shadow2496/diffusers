@@ -198,10 +198,10 @@ def main():
         dirnames = [path.split('/')[-2] for path in sorted(glob(os.path.join(args.save_dir, '??_*{}/'.format(suffix))))]
         save_new_image(args, dirnames, 'all_with_text_00-{:02d}{}.jpg'.format(len(dirnames) - 1, suffix))
 
-    if args.from_file and is_too_long:
-        split = args.save_dir.split('/')
-        split[-2] = '{}_too_long'.format(split[-2])
-        shutil.move(args.save_dir, '/'.join(split))
+    # if args.from_file and is_too_long:
+    #     split = args.save_dir.split('/')
+    #     split[-2] = '{}_too_long'.format(split[-2])
+    #     shutil.move(args.save_dir, '/'.join(split))
 
 
 if __name__ == '__main__':
