@@ -84,7 +84,7 @@ def main():
     args = parse_args()
     # TODO: safety_checker 역할을 하는 module이 SD3에는 없는지 확인
     pipe = StableDiffusion3Pipeline.from_pretrained(
-        args.model_dir, torch_dtype=torch.float16, revision=args.revision
+        args.model_dir, torch_dtype=torch.bfloat16, revision=args.revision
     ).to("cuda")
     # pipe.load_lora_weights(args.lora_ckpt)
     placeholder_token = load_model(pipe.text_encoder, pipe.tokenizer, args.lora_ckpt)
