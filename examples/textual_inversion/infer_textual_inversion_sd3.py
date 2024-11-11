@@ -192,7 +192,14 @@ def main():
                         images_tensor.append(transforms.ToTensor()(image))
         elif len(glob(os.path.join(save_dir, 'image*'))) == args.n_samples and args.save_grid:
             for i in range(args.n_samples):
-                image = Image.open(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i, text)))
+                while True:
+                    try:
+                        image = Image.open(os.path.join(save_dir, 'image{:03d}_{}_.png'.format(i, text)))
+                        break
+                    except:
+                        if not is_too_long:
+                            raise
+                        text = text[1:]
                 images_tensor.append(transforms.ToTensor()(image))
 
         if args.save_grid:
